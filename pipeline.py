@@ -59,14 +59,16 @@ con.execute(r"""
 CREATE OR REPLACE MACRO parse_ts(s) AS (CASE
   WHEN s IS NULL THEN NULL
   WHEN regexp_full_match(s, '[0-9]+') THEN
-    CASE WHEN length(ltrim(s, '0')) = 0 THEN 0::HUGEINT
-         WHEN length(ltrim(s, '0')) > 30 THEN CAST('1000000000000000000000000000000' AS HUGEINT)
-         ELSE CAST(ltrim(s, '0') AS HUGEINT) END
+    -- any value of 17+ significant digits is far outside every window: map it
+    -- to a sentinel instead of overflowing
+    CASE WHEN length(ltrim(s, '0')) = 0 THEN 0::BIGINT
+         WHEN length(ltrim(s, '0')) > 16 THEN 9000000000000000000::BIGINT
+         ELSE CAST(ltrim(s, '0') AS BIGINT) END
   WHEN regexp_full_match(s, '[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](Z|[+-]([01][0-9]|2[0-3]):[0-5][0-9])') THEN
-    (epoch_ms(try_strptime(s[1:19], '%Y-%m-%dT%H:%M:%S'))
+    epoch_ms(try_strptime(s[1:19], '%Y-%m-%dT%H:%M:%S'))
      - CASE WHEN length(s) = 20 THEN 0
             ELSE (CAST(s[21:22] AS BIGINT) * 60 + CAST(s[24:25] AS BIGINT)) * 60000
-                 * (CASE WHEN s[20:20] = '+' THEN 1 ELSE -1 END) END)::HUGEINT
+                 * (CASE WHEN s[20:20] = '+' THEN 1 ELSE -1 END) END
   ELSE NULL END)
 """)
 # ingest_ts is always valid F1
@@ -90,20 +92,23 @@ def fields_sql(n, names):
 
 
 def parsed(src, names):
-    """Subquery with one column per field name: dialect-checked, quotes stripped."""
+    """Subquery with one column per field name: dialect-checked, quotes stripped.
+    Lines without a quote only need the right field count; lines with a quote
+    must match the strict pattern (each field "..." or quote-free)."""
     n = len(names)
     rx = line_regex(n)
-    cols = ", ".join(f"{strip('g.' + x)} AS {x}" for x in names)
-    lst = ", ".join("'" + x + "'" for x in names)
-    return (f"(SELECT {cols} FROM (SELECT regexp_extract(line, '{rx}', [{lst}]) AS g FROM {src} "
-            f"WHERE regexp_matches(line, '{rx}')))")
+    cols = ", ".join(
+        f"CASE WHEN q THEN {strip(f's[{i + 1}]')} ELSE nullif(s[{i + 1}], '') END AS {x}" for i, x in enumerate(names)
+    )
+    return (f"(SELECT {cols} FROM (SELECT string_split(line, ',') AS s, contains(line, '\"') AS q, line FROM {src}) "
+            f"WHERE len(s) = {n} AND (NOT q OR regexp_matches(line, '{rx}')))")
 
 
 def strip(col):
     return f"nullif(CASE WHEN starts_with({col}, '\"') THEN {col}[2:length({col}) - 1] ELSE {col} END, '')"
 
 
-SMALL = 32 * 1024 * 1024
+SMALL = int(os.environ.get("SS_SMALL", 2 * 1024 * 1024))
 
 
 def _sources(paths):
@@ -211,14 +216,14 @@ log("idmap", len(people))
 con.execute(f"""
 CREATE TABLE ev AS
 WITH r AS (
-    SELECT event_id, user_id, ts_s, COALESCE(parse_ing(ing_s), parse_ts(ing_s)) AS ing, et, pid, price
+    SELECT event_id, user_id, parse_ts(ts_s) AS ts, parse_ing(ing_s) AS ing, et, pid, price
     FROM {parsed(raw('events'), ['event_id', 'user_id', 'ts_s', 'ing_s', 'et', 'pid', 'price'])}
     WHERE event_id IS NOT NULL
 ), d AS (
-    SELECT event_id, arg_min(struct_pack(user_id, ts_s, ing, et, pid, price), ing) AS k
+    SELECT event_id, arg_min(struct_pack(user_id, ts, ing, et, pid, price), ing) AS k
     FROM r GROUP BY event_id
 ), v AS (
-    SELECT k.user_id AS user_id, parse_ts(k.ts_s) AS ts, k.ing AS ing, k.et AS et, k.pid AS pid, k.price AS price
+    SELECT k.user_id AS user_id, k.ts AS ts, k.ing AS ing, k.et AS et, k.pid AS pid, k.price AS price
     FROM d
     WHERE k.user_id IS NOT NULL AND k.pid IS NOT NULL AND k.et IN ('view', 'cart', 'purchase')
 )
