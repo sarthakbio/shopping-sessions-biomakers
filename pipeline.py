@@ -111,15 +111,16 @@ def strip(col):
 SMALL = int(os.environ.get("SS_SMALL", 2 * 1024 * 1024))
 
 
-def _sources(paths):
+def _sources(paths, small_limit=None):
     """SQL for all lines (header removed) of the given files, as column `line`.
     Small files are read whole and split on \\n only, which keeps \\r as data;
     big files go through DuckDB's parallel reader."""
     total = sum(os.path.getsize(p) for p in paths)
     # The generator never writes \\r; DuckDB's reader drops a \\r before \\n, so
     # tiny (hand-written) inputs are read whole and split on \\n exactly.
-    small = paths if total < SMALL else []
-    big = [] if total < SMALL else paths
+    lim = SMALL if small_limit is None else small_limit
+    small = paths if total < lim else []
+    big = [] if total < lim else paths
     parts = []
     if small:
         lst = ", ".join("'" + p.replace("'", "''") + "'" for p in small)
@@ -136,10 +137,10 @@ def _sources(paths):
     return "(" + " UNION ALL ".join(parts) + ")"
 
 
-def raw(sub):
+def raw(sub, small_limit=None):
     d = os.path.join(DATA, sub)
     paths = sorted(os.path.join(d, f) for f in os.listdir(d) if f.endswith(".csv")) if os.path.isdir(d) else []
-    return _sources(paths)
+    return _sources(paths, small_limit)
 
 
 def raw_file(name):
@@ -171,7 +172,7 @@ WHERE campaign_id IS NOT NULL
 pairs = []
 if has_files("links"):
     pairs = con.execute(f"""
-        SELECT a, b FROM {parsed(raw('links'), ['a', 'b'])}
+        SELECT a, b FROM {parsed(raw('links', 32 * 1024 * 1024), ['a', 'b'])}
         WHERE a IS NOT NULL AND b IS NOT NULL AND a <> b
     """).fetchall()
 log("links", len(pairs))
@@ -216,7 +217,7 @@ log("idmap", len(people))
 con.execute(f"""
 CREATE TABLE ev AS
 WITH r AS (
-    SELECT event_id, user_id, parse_ts(ts_s) AS ts, parse_ing(ing_s) AS ing, et, pid, price
+    SELECT event_id, user_id, parse_ts(ts_s) AS ts, CASE WHEN parse_ing(ing_s) IS NULL THEN parse_ts(ing_s) ELSE parse_ing(ing_s) END AS ing, et, pid, price
     FROM {parsed(raw('events'), ['event_id', 'user_id', 'ts_s', 'ing_s', 'et', 'pid', 'price'])}
     WHERE event_id IS NOT NULL
 ), d AS (
